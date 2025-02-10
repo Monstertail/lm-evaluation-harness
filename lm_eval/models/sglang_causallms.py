@@ -56,6 +56,7 @@ class SGLangLM(TemplateLM):
         # parallelism
         dp_size: int = 1,
         tp_size: int = 1,
+        prefix_token_id: Optional[int] = None,
         **kwargs
     ):
         super().__init__()
@@ -82,7 +83,7 @@ class SGLangLM(TemplateLM):
             "trust_remote_code": trust_remote_code,
             "dtype": dtype,
             "kv_cache_dtype": kv_cache_dtype,
-            "context_length": int(self._max_length) if self._max_length else None,
+            "context_length": int(self._max_length) + 7 if self._max_length else None,
             "device": device,
             "mem_fraction_static": mem_fraction_static,
             "tp_size": self.tensor_parallel_size,
@@ -114,12 +115,76 @@ class SGLangLM(TemplateLM):
             eval_logger.info(
                 "Found 'gemma' in model name, a BOS token will be used as Gemma series models underperform without it."
             )
+        self.custom_prefix_token_id = prefix_token_id
 
-    def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
-        # Implement rolling loglikelihood calculation
-        # Return [log_prob, ...]
-        mocked = [0.0] * len(requests)
-        return mocked
+    def loglikelihood_rolling(
+        self, requests: List[Instance], disable_tqdm: bool = False
+    ) -> List[float]:
+        adaptive_batch_size = None
+        if self.batch_size == "auto":
+            adaptive_batch_size = len(requests)
+
+        # First, collect all windows from all requests
+        all_windows = []  # List of (request_idx, window) tuples
+        request_window_counts = []  # Track number of windows per request
+
+        for req_idx, (string,) in enumerate(
+            tqdm(
+                [req.args for req in requests],
+                disable=(disable_tqdm or (self.rank != 0)),
+            )
+        ):
+            rolling_token_windows: List[Tuple[List[int], List[int]]] = list(
+                map(
+                    make_disjoint_window,
+                    get_rolling_token_windows(
+                        token_list=self.tok_encode(string),
+                        prefix_token=self.prefix_token_id,
+                        # max_seq_len - (1 for context)
+                        max_seq_len=self.max_length - 1,
+                        context_len=1,
+                    ),
+                )
+            )
+
+            # TODO: Right now, we pass single EOT token to the Encoder and the full context to the decoder, in seq2seq case
+            windows = [(None,) + x for x in rolling_token_windows]
+
+            # Store windows with their request index
+            all_windows.extend((req_idx, window) for window in windows)
+            request_window_counts.append(len(windows))
+
+        all_nlls = []
+        batch_size = adaptive_batch_size or int(self.batch_size)
+        for i in range(0, len(all_windows), batch_size):
+            batch = all_windows[i : i + batch_size]
+            # Extract just the windows for processing, keeping track of request indices
+            batch_indices, batch_windows = zip(*batch)
+
+            batch_nlls = self._loglikelihood_tokens(
+                requests=batch_windows,
+                disable_tqdm=False,
+            )
+            # Store results with their request indices
+            all_nlls.extend(zip(batch_indices, batch_nlls))
+
+        # Reconstruct per-request loglikelihoods
+        loglikelihoods = []
+        current_idx = 0
+        for window_count in request_window_counts:
+            # Get all nlls for this request
+            request_nlls = all_nlls[current_idx : current_idx + window_count]
+            # Sum up the nlls for this request (discarding is_greedy)
+            request_total = sum(nll[0] for _, nll in request_nlls)
+            loglikelihoods.append(request_total)
+            current_idx += window_count
+
+            string = requests[len(loglikelihoods) - 1].args[0]
+            self.cache_hook.add_partial(
+                "loglikelihood_rolling", (string,), request_total
+            )
+
+        return loglikelihoods
 
     def generate_until(
         self, requests: List[Instance], disable_tqdm: bool = False
@@ -243,7 +308,7 @@ class SGLangLM(TemplateLM):
             return_logprob = return_logprob,
             top_logprobs_num = top_logprobs_num,
             logprob_start_len = logprob_start_len
-        )
+        )            
         return outputs
     
     @property

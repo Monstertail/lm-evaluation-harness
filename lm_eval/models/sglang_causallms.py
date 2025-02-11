@@ -83,7 +83,6 @@ class SGLangLM(TemplateLM):
             "trust_remote_code": trust_remote_code,
             "dtype": dtype,
             "kv_cache_dtype": kv_cache_dtype,
-            "context_length": int(self._max_length) + 7 if self._max_length else None,
             "device": device,
             "mem_fraction_static": mem_fraction_static,
             "tp_size": self.tensor_parallel_size,
@@ -92,7 +91,6 @@ class SGLangLM(TemplateLM):
         }
 
         self.model_args.update(kwargs)
-        server_args = ServerArgs(**self.model_args)
         self.batch_size = (
             "auto"
             if isinstance(batch_size, str) and "auto" in batch_size

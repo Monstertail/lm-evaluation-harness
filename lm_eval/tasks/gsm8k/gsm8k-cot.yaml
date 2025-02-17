@@ -3,7 +3,7 @@ dataset_path: gsm8k
 doc_to_target: '{{answer.split(''####'')[-1].strip() if answer is defined else target}}'
 doc_to_text: 'Q: {{question}}
 
-  A(Please follow the summarize the result at the end with the format of "The answer is xxx", where xx is the result.):'
+  A(Please summarize the result at the end with the format of "The answer is xxx," where xxx is the result.):'
 fewshot_config:
   sampler: first_n
   samples:
